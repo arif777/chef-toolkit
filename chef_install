@@ -1,0 +1,1039 @@
+#!/bin/sh
+#
+# This script installs and configures (or reconfigures) an Mu Master,
+# setting up the Mu tools, Chef, and assorted support libraries and utilities.
+#
+
+# XXX should probably get this through their main site or a mirror redirector,
+# rather than some random mirror
+EPEL_RPM="http://mirror.pnl.gov/epel/6/i386/epel-release-6-8.noarch.rpm"
+
+PACKAGES="git curl vim-enhanced zip unzip java-1.5.0-gcj java-1.7.0-openjdk mysql-server gcc gcc-c++ make libxml2-devel libxslt-devel cryptsetup-luks python-pip lsof mlocate strace nmap openssl-devel readline-devel python-devel ImageMagick-devel diffutils patch bind-utils httpd-tools gecode-devel mailx mysql-devel postgresql-devel openssl"
+DEL_PACKAGES="nagios"
+
+OPSCODE_CHEF_PKG="chef-server-core-12.0.4-1.el6.x86_64"
+OPSCODE_CHEF_DL="https://web-dl.packagecloud.io/chef/stable/packages/el/6/${OPSCODE_CHEF_PKG}.rpm"
+CHEF_CLIENT_PKG="chef-12.0.3-1"
+
+RUBY_RPM="https://s3.amazonaws.com/cap-public/ruby212-2.1.2p205-1.el6.x86_64.rpm"
+RUBY_INSTALL_DIR="/opt/rubies/ruby212-2.1.2-p205"
+
+GET_METADATA=""
+RCFILE=".murc"
+
+BOLD=`tput bold`
+NORM=`tput sgr0`
+BLACK=`tput setaf 0`
+RED=`tput setaf 1`
+GREEN=`tput setaf 2`
+YELLOW=`tput setaf 3`
+BLUE=`tput setaf 4`
+PINK=`tput setaf 5`
+CYAN=`tput setaf 6`
+WHITE=`tput setaf 7`
+
+CONFIG_VARS="ADMIN_EMAIL ADMIN_PW INSTALLDIR DATADIR CHEF_REPOS CHEF_PUBLIC_IP"
+
+
+usage()
+{
+	echo "Create or reconfigure your Chef master."
+	echo "Usage: $0 [-d] [-c /path/to/murc] [-p chef_public_ip]"
+    echo "    -d: Use default values and run non-interactively."
+	echo "    -k: Run curl with -k to skip SSL certificate checks."
+	exit 1
+}
+
+
+while getopts "c:dhkp:" opt; do
+		case $opt in
+			c)
+			  CAPRC=$OPTARG
+			  ;;
+			d)
+			  use_defaults=1
+			  ;;
+			k)
+			  curl_dash_k=1
+			  ;;
+			p)
+     
+			  CHEF_PUBLIC_IP=$OPTARG
+			  ;;  
+			h)
+			  usage
+			  ;;
+			\?)
+			  usage
+			  ;;
+		esac
+done
+
+
+
+ADMIN_EMAIL="testaws199@gmail.com"
+ADMIN_PW="pass1234"
+USER=`whoami`
+HOMEDIR="`getent passwd \"$USER\" |cut -d: -f6`"
+CHEF_CACHE="$HOMEDIR/.chef"
+HOSTNAME=`hostname -s`
+
+
+echo "$CHEF_PUBLIC_IP"
+
+
+if [ "$CHEF_PUBLIC_IP" == "" ];then
+	CHEF_PUBLIC_IP=`ifconfig | awk '/inet addr/{print substr($2,6)}' | head -n1`
+fi
+
+
+
+if [ "$INSTALLDIR" == "" ];then
+	INSTALLDIR="/opt/cap"
+fi
+
+if [ "$DATADIR" == "" ];then
+	if [ "$USER" != "root" ];then
+		DATADIR="$HOMEDIR/.cap"
+	else
+		DATADIR="$INSTALLDIR/var"
+	fi
+fi
+if [ "$LIBDIR" == "" ];then
+	LIBDIR="$INSTALLDIR/lib"
+fi
+if [ "$CAPRC" == "" ];then
+	if [ "$USER" != "root" ];then
+		CAPRC="$HOMEDIR/$RCFILE"
+	else
+		CAPRC="$INSTALLDIR/etc/cap.rc"
+		test -f "$INSTALLDIR/etc/cap.rc" || ( mkdir -p $INSTALLDIR/etc && touch "$INSTALLDIR/etc/cap.rc" )
+		chmod 755 $INSTALLDIR/etc
+	fi
+fi
+
+# Source the global .murc file, then overlay the local one if it exists
+test -f "$INSTALLDIR/etc/cap.rc" && source "$INSTALLDIR/etc/cap.rc"
+if [ -f "$CAPRC" -a "$CAPRC" != "$INSTALLDIR/etc/cap.rc" ] ;then
+	source $CAPRC
+fi
+
+
+###############################################################################
+fail_with_message()
+{
+	if [ "$1" != "" ];then
+		echo ""
+		echo "${RED}*******************************************************************************${NORM}"
+		echo "${RED}*******************************************************************************${NORM}"
+		echo $1
+		test "$2" != "" && echo $2
+		echo "${RED}*******************************************************************************${NORM}"
+		echo "${RED}*******************************************************************************${NORM}"
+		echo ""
+	fi
+	exit 1
+}
+
+###############################################################################
+warning_message()
+{
+	if [ "$1" != "" ];then
+		echo ""
+		echo "${YELLOW}*******************************************************************************${NORM}"
+		echo $1
+		test "$2" != "" && echo $2
+		echo "${YELLOW}*******************************************************************************${NORM}"
+		echo ""
+	fi
+}
+
+
+
+###############################################################################
+status_message()
+{
+	if [ "$1" != "" ];then
+		echo ""
+		echo "${GREEN}*******************************************************************************${NORM}"
+		echo $1
+		test "$2" != "" && echo $2
+		echo "${GREEN}*******************************************************************************${NORM}"
+		echo ""
+	fi
+}
+
+###############################################################################
+update_caprc()
+{
+	name="$1"
+	value="$2"
+	caprc_path="$3"
+	if [ "$caprc_path" == "" ];then
+		caprc_path="$CAPRC"
+	fi
+	if [ "$name" == "" ];then
+		fail_with_message "update_caprc called with missing variable name"
+	fi
+	test -f $caprc_path && sed -i "/^export $name=.*/d" $caprc_path
+	echo "export $name=\"$value\"" >> $caprc_path
+	chmod 644 $caprc_path
+}
+
+###############################################################################
+set_path_env_vars()
+{
+	REPO_NAME="`echo $REPO | cut -d/ -f2 | sed -e 's/\.git$//'`"
+	HOMEDIR="`getent passwd \"$USER\" |cut -d: -f6`"
+	CHEF_CACHE="$HOMEDIR/.chef"
+	SSHDIR="$HOMEDIR/.ssh"
+	ENVFILE="$HOMEDIR/.bash_profile"
+	mkdir -p $INSTALLDIR/etc $INSTALLDIR/bin $DATADIR
+	chmod 755 $INSTALLDIR $DATADIR
+	DEVOPS_TMP_DIR='/tmp/.cap.$$'
+	update_caprc INSTALLDIR $INSTALLDIR
+	update_caprc DATADIR $DATADIR
+}
+
+pivotal_cfg_setup(){
+	pivotal_cfg="-u pivotal -k /etc/opscode/pivotal.pem"
+	knife ssl fetch $pivotal_cfg > /dev/null 2>&1
+	eval "$1=\"$pivotal_cfg\""
+}
+
+keychain()
+{
+	yum -y localinstall http://pkgs.repoforge.org/keychain/keychain-2.7.0-1.el6.rf.noarch.rpm
+}
+
+
+remove_chef_org()
+{
+	org="$1"
+
+	pivotal_cfg_setup pivotal_cfg
+	# chef-server-ctl generates a spectcular amount of stupid noise
+	filter="(ffi-yajl|falling back to ffi)"
+
+	if ! /opt/opscode/bin/chef-server-ctl org-list $pivotal_cfg 2>&1 | egrep -v "$filter" | grep "^$org$" >/dev/null;then
+		warning_message "Chef org ${BOLD}$org${NORM} already removed"
+	else
+		status_message "Deleting Chef org ${BOLD}$org${NORM}"
+		/opt/opscode/bin/chef-server-ctl org-delete -y "$org" $pivotal_cfg 2>&1 | egrep -v "$filter"
+	fi
+}
+
+manage_chef_org()
+{
+	org=$1
+	orgname=$2
+	add_user=$3
+	association_user=$4
+
+	pivotal_cfg_setup pivotal_cfg
+	# chef-server-ctl generates a spectcular amount of stupid noise
+	filter="(ffi-yajl|falling back to ffi)"
+
+	if [ "$orgname" == "" ];then
+		orgname="$org"
+	fi
+
+	mkdir -p $DATADIR/orgs/$org
+
+	assoc=""
+	if [ "$association_user" != "" ];then
+		assoc="-a $association_user"
+	fi
+	keypath="$DATADIR/orgs/$org/$org.org.key"
+	if ! /opt/opscode/bin/chef-server-ctl org-list $pivotal_cfg 2>&1 | egrep -v "$filter" | grep "^$org$" >/dev/null;then
+		if [ "$association_user" != "" ];then
+			status_message "Creating Chef organization ${BOLD}$org${NORM} with admin user ${BOLD}$association_user${NORM}"
+		else
+			status_message "Creating Chef organization ${BOLD}$org${NORM}"
+		fi
+		attempts=0
+
+		while : ;do
+			/bin/rm -f $keypath
+			cmd="/opt/opscode/bin/chef-server-ctl org-create $org $orgname $assoc -f $keypath $pivotal_cfg"
+			$cmd 2>&1 | egrep -v "$filter"
+		  test -f $keypath && grep 'BEGIN RSA PRIVATE KEY' $keypath > /dev/null && break
+			attempts=`expr $attempts + 1`
+			if [ $attempts -gt 5 ];then
+				output="`$cmd 2>&1 | egrep -v \"$filter\"`"
+				warning_message "Unable to set up Chef org ${BOLD}$org${NORM}" "$cmd: $output"	
+				break
+			fi
+		done
+		if [ "$association_user" != "" ];then
+			if [ "$association_user" != "admin" ];then
+				user_home="`getent passwd \"$association_user\" |cut -d: -f6`"
+			else
+				user_home="`getent passwd \"root\" |cut -d: -f6`"
+			fi
+			mkdir -p "$user_home/.chef"
+			/bin/cp -f "$keypath" "$user_home/.chef/"
+		fi
+	fi
+
+	if [ "$add_user" != "" -a "$add_user" != "$association_user" ];then
+		status_message "Adding ${BOLD}$add_user${NORM} to Chef organization ${BOLD}$org${NORM}"
+		cmd="/opt/opscode/bin/chef-server-ctl org-user-add $org $add_user $pivotal_cfg"
+		$cmd 2>&1 | egrep -v "$filter"
+		if [ "$org" != "admin" ];then
+			if [ "$add_user" != "admin" ];then
+				user_home="`getent passwd \"$add_user\" |cut -d: -f6`"
+			else
+				user_home="`getent passwd \"root\" |cut -d: -f6`"
+			fi
+			mkdir -p "$user_home/.chef"
+			/bin/cp -f "$keypath" "$user_home/.chef/"
+		fi
+	fi
+#		warning_message "Failed to add ${BOLD}$user${NORM} to Chef org ${BOLD}$org${NORM}" "$cmd"
+}
+
+remove_chef_user_from_org()
+{
+	user="$1"
+	org="$2"
+
+	pivotal_cfg_setup pivotal_cfg
+	# chef-server-ctl generates a spectcular amount of stupid noise
+	filter="(ffi-yajl|falling back to ffi)"
+
+	status_message "Removing ${BOLD}$user${NORM} from Chef org ${BOLD}$org${NORM}"
+
+	/opt/opscode/bin/chef-server-ctl org-user-remove "$org" "$user" -y $pivotal_cfg 2>&1 | egrep -v "$filter"
+}
+
+remove_chef_user()
+{
+	user="$1"
+
+	pivotal_cfg_setup pivotal_cfg
+	# chef-server-ctl generates a spectcular amount of stupid noise
+	filter="(ffi-yajl|falling back to ffi)"
+
+	if ! /opt/opscode/bin/chef-server-ctl user-list $pivotal_cfg 2>&1 | egrep -v "$filter" | grep "^$user$" >/dev/null;then
+		warning_message "Chef user ${BOLD}$user${NORM} already removed"
+	else
+		remove_chef_org "$user"
+		for org in `/opt/opscode/bin/chef-server-ctl user-show $user --with-orgs $pivotal_cfg 2>&1 | egrep -v "$filter" | grep ^organizations: |cut -d: -f2`;do
+			remove_chef_user_from_org "$user" "$org"
+		done
+		status_message "Deleting Chef user ${BOLD}$user${NORM}"
+		/opt/opscode/bin/chef-server-ctl user-delete "$user" -y $pivotal_cfg 2>&1 | egrep -v "$filter"
+	fi
+}
+
+list_chef_users(){
+	# chef-server-ctl generates a spectcular amount of stupid noise
+	filter="(ffi-yajl|falling back to ffi)"
+	list="`/opt/opscode/bin/chef-server-ctl user-list 2>&1 | egrep -v \"$filter\" | egrep -v '^(pivotal)$' | tr -s '\n' ' '`"
+	eval "$1=\"$list\""
+}
+
+
+manage_chef_user()
+{
+	user="$1"
+	pass="$2"
+	name="$3"
+	email="$4"
+	org="$5"
+	is_admin="$6"
+	is_normal="$7"
+	replace="$8"
+
+	if [ "$is_admin" == "1" -a "$is_normal" == "1" ];then
+		fail_with_message "Can't force-set a Chef user to both administrator and regular user"
+	fi
+
+	mkdir -p "$DATADIR/users/$user"
+	pivotal_cfg_setup pivotal_cfg
+	# chef-server-ctl generates a spectcular amount of stupid noise
+	filter="(ffi-yajl|falling back to ffi)"
+
+	if ! ( [ -f "$DATADIR/users/$user/$user.user.key" ] && /opt/opscode/bin/chef-server-ctl user-list 2>&1 | egrep -v "$filter" | grep "^$user$" >/dev/null );then
+		ok=1
+		if [ "$name" == "" ];then
+			warning_message "Must supply a real name to create new Chef user ${BOLD}$user${NORM}"
+			ok=0
+		fi
+		if [ "$email" == "" ];then
+			warning_message "Must supply an email address to create new Chef user ${BOLD}$user${NORM}"
+			ok=0
+		fi
+		if [ "$pass" == "" ];then
+			warning_message "Must supply a password to create new Chef user ${BOLD}$user${NORM}"
+			ok=0
+		fi
+		if [ "$ok" != "1" ];then
+			return
+		fi
+		status_message "Creating Chef user ${BOLD}$user${NORM} - $name ($email)"
+		attempts=0
+		keypath="$DATADIR/users/$user/$user.user.key"
+		if [ ! -f "$DATADIR/users/$user/$user.user.key" -a "$replace" != "" ];then
+			/opt/opscode/bin/chef-server-ctl user-delete "$user" -y $pivotal_cfg 2>&1 | egrep -v "$filter"
+		fi
+		create_cmd="/opt/opscode/bin/chef-server-ctl user-create $user $name $email $pass $pivotal_cfg -f $keypath"
+		while : ;do
+			/bin/rm -f "$keypath"
+			# XXX Flinging passwords around CLI calls is terrible, need a better way
+			# to do this. Maybe we need local-brew directory services.
+			$create_cmd 2>&1 | egrep -v "$filter"
+			test -f "$keypath" && grep 'BEGIN RSA PRIVATE KEY' "$keypath" > /dev/null && break
+			attempts=`expr $attempts + 1`
+			if [ $attempts -gt 5 ];then
+				output="`$create_cmd 2>&1 | egrep -v \"$filter\"`"
+				warning_message "Unable to set up Chef ${BOLD}$user${NORM} user" "$create_cmd: $output"	
+				break
+			fi
+		done
+		if [ "$user" != "admin" ];then
+			user_home="`getent passwd \"$user\" |cut -d: -f6`"
+		else
+			user_home="`getent passwd \"root\" |cut -d: -f6`"
+		fi
+		mkdir -p "$user_home/.chef"
+		/bin/cp -f "$keypath" "$user_home/.chef/"
+
+		manage_chef_org "$user" "$user" "" "$user"
+		set_knife_rb "organizations/$user" "$user" "$user_home/.chef"
+
+		status_message "Configuring ${BOLD}$user_home/.chef/client.rb${NORM}"
+		cat /dev/null > "$user_home/.chef/client.rb"
+		cat >> "$user_home/.chef/client.rb" << EOF
+#
+# Client settings
+#
+log_level        :info
+log_location     STDOUT
+chef_server_url  "https://#{ENV['CHEF_PUBLIC_IP']}/organizations/$user"
+validation_client_name '$user-validator'
+EOF
+		if [ "$user" != "admin" ];then
+			chown -R "$user" "$user_home/.chef/"
+			su - "$user" -c "/opt/chef/bin/knife ssl fetch" > /dev/null 2>&1
+		else
+			/opt/chef/bin/knife ssl fetch > /dev/null 2>&1
+		fi
+
+
+		if [ "$add_org" != "" ];then
+			manage_chef_org "$add_org" "$add_org" "$user" "admin"
+		fi
+		if [ "$is_admin" == "1" ];then
+			manage_chef_org "mu" "" "$user"
+		elif [ "$is_normal" == "1" ];then
+			remove_chef_user_from_org "$user" "admin"
+		fi
+	else
+		status_message "Updating Chef user ${BOLD}$user${NORM}"
+		if [ "$add_org" != "" ];then
+			manage_chef_org "$add_org" "$add_org" "$user" "admin"
+		fi
+		if [ "$is_admin" == "1" ];then
+			manage_chef_org "mu" "" "$user"
+		elif [ "$is_normal" == "1" ];then
+			remove_chef_user_from_org "$user" "admin"
+		fi
+		if [ "$password" != "" ];then
+			warning_message "You'll have to enter the new password again for Chef" "Also it will display it back to you in plain text. Yeah."
+			/opt/opscode/bin/chef-server-ctl password $user
+		fi
+	fi
+}
+
+
+###############################################################################
+validate_setup_env_vars(){
+	n=1
+	validate_errs=0
+	while [ "${var_name[$n]}" != "" ];do
+		if [ "${var_name[$n]}" == "CHEF_PUBLIC_IP" ]; then
+			if [ "${var_val[$n]}" == "" ];then
+				warning_message "An IP accessible to client nodes must be specified"
+				validate_errs=1
+			fi	
+		elif [ "${var_name[$n]}" == "ADMIN_EMAIL" ]; then
+			if [ "${var_val[$n]}" == "" ];then
+				warning_message "You must specify an email contact for the 'admin' user."
+				validate_errs=1
+			fi	
+		elif [ "${var_name[$n]}" == "ADMIN_PW" -a ! -f "$CHEF_CACHE/admin.user.key" ]; then
+			if [ "${var_val[$n]}" == "" ];then
+				warning_message "You must specify a password for the 'admin' user."
+				validate_errs=1
+			fi	
+		fi
+		n=$[$n +1]
+	done
+}
+
+###############################################################################
+print_setup_env_vars(){
+	echo "${CYAN}System-wide settings${NORM}:"
+	for ro in $RO_CONFIG_VARS;do
+			echo "  ${BOLD}$ro${NORM}: ${CYAN}${!ro}${NORM}"
+	done
+	echo "${GREEN}Configurable settings to write to ${BOLD}$CAPRC${NORM}:"
+	n=1
+	while [ "${var_name[$n]}" != "" ];do
+		if [ "${var_name[$n]}" == "CHEF_PUBLIC_IP" ]; then
+			echo "  ${BOLD}$n${NORM}) ${var_name[$n]} (OPTIONAL; will try to guess): ${GREEN}${var_val[$n]}${NORM}"
+		elif [ "${var_name[$n]}" == "ADMIN_EMAIL" ]; then
+			echo "  ${BOLD}$n${NORM}) ${var_name[$n]} (required): ${GREEN}${var_val[$n]}${NORM}"
+		elif [ "${var_name[$n]}" == "ADMIN_PW" ]; then
+			if [ "${var_val[$n]}" != "" -o -f "$CHEF_CACHE/admin.user.key" ];then
+				echo "  ${BOLD}$n${NORM}) ${var_name[$n]} (required): ********"
+			else
+				echo "  ${BOLD}$n${NORM}) ${var_name[$n]} (required):"
+			fi
+		else
+			echo "  ${BOLD}$n${NORM}) ${var_name[$n]}: ${GREEN}${var_val[$n]}${NORM}"
+		fi
+		n=$[$n +1]
+	done
+}
+
+###############################################################################
+chef_server_ctl()
+{
+	cmd=$1
+	status_message "/opt/opscode/bin/chef-server-ctl $cmd"
+	if ! /opt/opscode/bin/chef-server-ctl $cmd > /dev/null;then
+		status_message "Bad exit code from chef-server-ctl $cmd! Logs:"
+		(/opt/opscode/bin/chef-server-ctl tail) & pid=$!
+		pgid="`ps x -o  \"%p %r %y %x %c \" | egrep \"^[[:space:]]*$pid[[:space:]]+\" | awk '{print $2}'`"
+		sleep 10 && kill -TERM -$pgid
+		fail_with_message "Bad exit code from chef-server-ctl $cmd! See above logs. $pid $pgid"
+	fi
+}
+
+show_config_vars()
+{
+
+for v in $CONFIG_VARS;do
+		echo "$v : ${!v}"
+done
+
+}
+
+###############################################################################
+adjust_config_vars()
+{
+	n=1
+	for v in $CONFIG_VARS;do
+		var_name[$n]=$v
+		var_val[$n]=${!v}
+		n=$[$n +1]
+	done
+	last_var=$n
+
+	print_setup_env_vars
+	bypass_aws_creds=0
+	while 
+		read -p "Enter ${BOLD}O${NORM} to proceed with this config, or select a number to change. `echo $'\n> '`" config
+	do
+		echo ""
+		if [ "$config" == "O" -o "$config" == "o" ];then
+			validate_setup_env_vars
+			if [ $validate_errs == 0 ];then
+				break
+			fi
+		elif ! echo $config | egrep '^[0-9]{1,2}$' ; then
+			warning_message "Invalid option $config"
+			print_setup_env_vars
+			continue
+		elif [ "${var_name[$config]}" != "" ] 2>/dev/null ;then
+			if [ "${var_name[$config]}" == "ADDTL_CHEF_REPOS" ]; then
+				echo "Enter the Github repos from which we'll pull Chef artifacts additional to those "
+				echo "from $REPO. Delineate multiple repositories with spaces. Example:"
+				echo "${BOLD}eGT-Labs/chef-master.git HHS/healthdata_platform.git${NORM}"
+				echo ""
+			fi
+			if [ "${var_name[$config]}" == "ADMIN_EMAIL" ];then
+				echo "Enter an email address for the internal 'admin' user."
+				echo "Note that you won't be able to reuse this address for a regular user. See also:"
+				echo "https://github.com/chef/chef-server/issues/59"
+			fi
+			if [ "${var_name[$config]}" == "ADMIN_PW" ];then
+				read -s -p "Enter password for the ${BOLD}mu${NORM} admin user. `echo $'\n> '`" newval
+			else
+				read -p "Enter new value for ${BOLD}${var_name[$config]}${NORM}. `echo $'\n> '`" newval
+			fi
+
+			if [ "${var_name[$config]}" == "ADMIN_EMAIL" ];then
+				ok=1
+				if ! ( echo $newval | egrep '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,6}$' ) ; then
+					ok=0
+				fi
+				if [ $ok == 0 ];then
+					warning_message "You must specify one or more valid email addresses!"
+			        print_setup_env_vars
+					continue
+				fi
+			fi
+			var_val[$config]=$newval
+			print_setup_env_vars
+		fi
+	done
+
+	n=1
+	homedir="`getent passwd \"$USER\" |cut -d: -f6`"
+	while [ "${var_name[$n]}" != "" ];do
+		if [ "${var_name[$n]}" != "PATH" ];then
+			eval "export ${var_name[$n]}=\"${var_val[$n]}\""
+		fi
+		
+		if [ "${var_name[$n]}" != "ADMIN_PW" ];then
+			update_caprc ${var_name[$n]} "${var_val[$n]}"
+		fi
+		n=$[$n +1]
+	done
+	
+	
+}
+
+
+###############################################################################
+create_ssh_config()
+{
+	mkdir -p $SSHDIR
+	touch $SSHDIR/config
+	chmod 600 $SSHDIR/config
+#  grep "^StrictHostKeyChecking " $SSHDIR/config || echo "StrictHostKeyChecking no" >> $SSHDIR/config
+}
+
+
+###############################################################################
+set_up_github_ssh_key()
+{
+	set -e
+	keyname="github-key-from-install.$$"
+	echo "Paste a ${BOLD}private${NORM} SSH key for $1 here (^D to commit):"
+	cat > $SSHDIR/$keyname
+	chmod 400 $SSHDIR/$keyname
+	echo "Host github.com" >> $SSHDIR/config
+	echo "  User git" >> $SSHDIR/config
+	echo "  IdentityFile $SSHDIR/$keyname" >> $SSHDIR/config
+	echo "  StrictHostKeyChecking no" >> $SSHDIR/config
+	set +e
+	export keyname
+}
+
+###############################################################################
+# Only use this if called right after set_up_github_ssh_key. It's not smart.
+expunge_github_ssh_key(){
+	keyname=$1
+	head -n -3 $SSHDIR/config > $SSHDIR/config.tmp.$$
+	/bin/mv -f $SSHDIR/config.tmp.$$ $SSHDIR/config
+	/bin/rm -f $keyname
+	unset keyname
+}
+
+
+
+fix_platform_repo_permissions()
+{
+	chefdir="$1"
+	if [ "$chefdir" != "" ];then
+		chmod go+rx $chefdir
+		for subdir in applications cookbooks site_cookbooks roles environments data_bags modules Berks* README.md LICENSE.md demo;do
+			if [ -e "$chefdir/$subdir" ];then
+				find "$chefdir/$subdir" -type d -exec chmod go+rx {} \;
+				find "$chefdir/$subdir" -type f -exec chmod go+r {} \;
+			fi
+		done
+	fi
+}
+
+###############################################################################
+clone_repository()
+{
+	set +e
+	repo=$1
+	clone_path=$2
+
+	clone_ssh="git clone git@github.com:$repo $clone_path"
+	mkdir -p $clone_path
+	if [ "$(ls -A $clone_path)" ];then
+		echo "$clone_path exists and is non-empty. I'm going to assume the repo has already been cloned..."
+		sleep 3
+	else
+		mkdir -p $SSHDIR
+		if [ "`grep ^github.com $SSHDIR/known_hosts 2>/dev/null`" != "" ];then
+			echo "Attempting to clone $repo with existing keys..."
+			echo $clone_ssh
+			$clone_ssh 2>&1 > /dev/null
+		fi
+		if [ $? != 0 -o "`grep ^github.com $SSHDIR/known_hosts 2>/dev/null`" == "" ];then
+			echo ""
+			authtype=""
+			echo "We'll need a key for access to ${BOLD}$repo${NORM}."
+			if [ "$use_defaults" != "" ];then
+			  fail_with_message "In non-interactive mode, but I need Git credentials! Run without -n."
+			fi
+			while /bin/true ;do
+			    rm -rf $clone_path
+			    expunge_github_ssh_key $keyname
+			    echo ""
+			    set_up_github_ssh_key $repo
+			    echo $clone_ssh
+			    $clone_ssh && break
+			done
+		fi
+	fi
+
+	fix_platform_repo_permissions "$clone_path"
+}
+
+###############################################################################
+set_hostname()
+{
+	if [ "$HOSTNAME" != "`hostname -s`" ];then
+		hostname $HOSTNAME
+		sed -i "s/^HOSTNAME=.*/HOSTNAME=$HOSTNAME/" /etc/sysconfig/network
+	fi
+	if ! grep "^$MY_PRIVATE_IP $HOSTNAME CHEF-MASTER" /etc/hosts > /dev/null;then
+		sed -i "/ $HOSTNAME/d" /etc/hosts
+		sed -i "/^$MY_PRIVATE_IP/d" /etc/hosts
+		echo "$MY_PRIVATE_IP $HOSTNAME CHEF-MASTER" >> /etc/hosts
+		if [ "$MY_PRIVATE_IP" != "$MY_PUBLIC_IP" -a "$MY_PUBLIC_IP" != "" ];then
+			sed -i "/^$MY_PUBLIC_IP/d" /etc/hosts
+			echo "$MY_PUBLIC_IP $HOSTNAME CHEF-MASTER" >> /etc/hosts
+		fi
+#		if [ "$CHEF_PUBLIC_IP" != "$MY_PUBLIC_IP" -a "$CHEF_PUBLIC_IP" != "" ];then
+#			echo "$CHEF_PUBLIC_IP $HOSTNAME CHEF-MASTER" >> /etc/hosts
+#		fi
+	fi
+	export HOSTNAME
+}
+
+
+###############################################################################
+install_system_packages()
+{
+
+
+	if [ ! -f /etc/yum.repos.d/epel.repo ];then
+		status_message "Installing ${BOLD}EPEL${NORM}"
+		rpm -ivh ${EPEL_RPM}
+	fi
+
+	install_me=""
+	for pkg in $PACKAGES;do
+		rpm -q $pkg 2>&1 > /dev/null || install_me="${install_me} $pkg"
+	done
+
+
+	if [ "$install_me" != "" ];then
+		status_message "Installing ${BOLD}base packages ${NORM}"
+
+		status_message "$install_me"
+
+		yum -y install ${install_me} || exit 1
+	fi
+
+	uninstall_me=""
+
+	if [ "$uninstall_me" != "" ];then
+		yum -y erase ${uninstall_me} || exit 1
+	fi
+
+	install_keyChain
+}
+
+
+###############################################################################
+set_bash_defaults()
+{
+	status_message "Initializing ${BOLD}shell environment${NORM}"
+
+	# Stange-isms, maybe these don't belong here.
+	grep "alias vi=" $HOMEDIR/.bashrc > /dev/null || echo "alias vi=vim" >> $HOMEDIR/.bashrc
+	grep "export EDITOR=vim" $HOMEDIR/.bashrc > /dev/null || echo "export EDITOR=vim" >> $HOMEDIR/.bashrc
+
+	update_caprc PATH "$INSTALLDIR/bin:/usr/local/ruby-current/bin:\${PATH}:/opt/opscode/embedded/bin"
+
+	grep "^source $CAPRC" $HOMEDIR/.bashrc > /dev/null || echo "source $CAPRC" >> $HOMEDIR/.bashrc
+
+}
+
+
+###############################################################################
+clone_repository()
+{
+	rpm -q git > /dev/null || yum -y install git || exit 1
+	status_message "Cloning ${BOLD}$REPO${NORM} to $LIBDIR"
+	clone_repository $REPO "$LIBDIR"
+	status_message "Checking out $CAPBRANCH"
+	cd "$LIBDIR" && git checkout "$CAPBRANCH"
+
+}
+
+install_keyChain()
+{
+	yum -y localinstall http://pkgs.repoforge.org/keychain/keychain-2.7.0-1.el6.rf.noarch.rpm
+}
+
+###############################################################################
+## Go fetch a current version of Ruby.  Some of our tools will need this,
+## and this isn't the same as the Ruby that is bundled with Chef, which
+## will reside in its own /opt/chef sandbox and should be left unmolested.
+install_ruby()
+{
+	status_message "Installing latest ${BOLD}Ruby${NORM} stable snapshot"
+
+	if ! rpm -q ruby212 > /dev/null ;then
+		yum -y localinstall $RUBY_RPM
+	fi
+	rm -f /usr/local/ruby-current 
+	ln -s $RUBY_INSTALL_DIR /usr/local/ruby-current
+
+	# Init cap's gem library now that it has a Ruby to use.
+	export USE_SYSTEM_GECODE=1
+	#if [ ! -f $RUBY_INSTALL_DIR/bin/bundle ];then
+	#	$RUBY_INSTALL_DIR/bin/gem install bundler
+	#	cd $LIBDIR/modules && $RUBY_INSTALL_DIR/bin/bundle install
+	#fi
+	add_chef_support_gems $RUBY_INSTALL_DIR
+
+}
+
+
+###############################################################################
+punch_tcp_hole()
+{
+	port=$1
+#	status_message "Opening firewall for port ${BOLD}$port${NORM}"
+	/sbin/iptables -nL | egrep "^ACCEPT.*dpt:$port($| )" > /dev/null || ( /sbin/iptables -I INPUT -p tcp --dport $port -j ACCEPT && service iptables save )
+}
+
+
+###############################################################################
+## Install gems for Rubies that use Chef
+add_chef_support_gems()
+{
+	rubydir=$1
+	rm -rf /tmp/cap-gem-setup.$$
+	mkdir -p /tmp/cap-gem-setup.$$
+	$rubydir/bin/gem list > /tmp/cap-gem-setup.$$/gemlist.txt
+	grep '^bundler ' /tmp/cap-gem-setup.$$/gemlist.txt > /dev/null || $rubydir/bin/gem install bundler --no-rdoc --no-ri
+
+	status_message "Installing support gems in $rubydir"
+
+	echo 'source "https://rubygems.org"' > /tmp/cap-gem-setup.$$/Gemfile
+	for pkg in bundler ohai knife-ec2 chef-vault foodcritic yard colorize color json json-schema trollop fileutils aws-sdk-core knife-windows simple-password-gen netaddr;do
+		echo "gem '$pkg'" >> /tmp/cap-gem-setup.$$/Gemfile
+	done
+
+	cd /tmp/cap-gem-setup.$$ && $rubydir/bin/bundle install
+	cd
+	rm -rf /tmp/cap-gem-setup.$$
+
+	find $rubydir/ -type f -exec chmod go+r {} \;
+	find $rubydir/bin -type f -exec chmod go+rx {} \;
+	find $rubydir/ -type d -exec chmod go+rx {} \;
+}
+
+
+###############################################################################
+## Set up knife.rb for root
+set_knife_rb()
+{
+	basepath="$1"
+	knife_user="$2"
+	chef_cache="$CHEF_CACHE"
+
+	if [ "$knife_user" == "" ];then
+		knife_user="admin"
+	elif [ "$knife_user" != "admin" ];then
+		chef_cache="`getent passwd \"$association_user\" |cut -d: -f6`/.chef"
+	fi
+	mkdir -p $chef_cache
+	cat /dev/null > $chef_cache/knife.rb
+
+	cat > $chef_cache/knife.rb.tmp.$$ << EOF
+log_level                :info
+log_location             STDOUT
+node_name                '$knife_user'
+client_key               '$chef_cache/$knife_user.user.key'
+validation_client_name   '$knife_user-validator'
+validation_key           '$chef_cache/$knife_user.org.key'
+chef_server_url "https://$CHEF_PUBLIC_IP:443/$basepath"
+chef_server_root "https://$CHEF_PUBLIC_IP:443/$basepath"
+syntax_check_cache_path  '$chef_cache/syntax_check_cache'
+cookbook_path [ '$chef_cache/cookbooks', '$chef_cache/site_cookbooks' ]
+knife[:vault_mode] = 'client'
+knife[:vault_admins] = ['$knife_user']
+EOF
+	mv -f $chef_cache/knife.rb.tmp.$$ $chef_cache/knife.rb
+}
+
+###############################################################################
+## Install the Chef Omnibus package.
+install_chef()
+{
+	punch_tcp_hole 80
+	punch_tcp_hole 443
+	if ! grep '^admin-users:' /etc/group > /dev/null ;then
+		/usr/sbin/groupadd admin-users
+	fi
+	for u in `ls $DATADIR/users/`;do
+		if [ "$u" != "admin" ];then
+			/usr/sbin/usermod -a -G admin-users $u
+		fi
+	done
+
+	# Chef Server 12 inexplicably ships with old, broken versions of the
+	# client. Install something sane.
+	if ! rpm -q $CHEF_CLIENT_PKG > /dev/null ;then
+		status_message "Installing current Chef client"
+		yum -y erase chef
+		curl https://www.opscode.com/chef/install.sh > /root/chef-install.sh
+		sh /root/chef-install.sh
+	fi
+	add_chef_support_gems /opt/chef/embedded
+	set_knife_rb organizations/admin
+
+	# Now Chef server
+	if ! rpm -q chef-server-core > /dev/null ;then
+		if rpm -q chef-server > /dev/null ;then
+			/opt/chef-server/bin/chef-server-ctl stop
+		fi
+		status_message "Installing ${BOLD}Chef Server${NORM}"
+		rpm -ivh $OPSCODE_CHEF_DL
+		find /opt/opscode/embedded/lib/ruby -type f -exec chmod o+r {} \;
+		find /opt/opscode/embedded/lib/ruby -type d -exec chmod o+rx {} \;
+		/opt/opscode/bin/chef-server-ctl reconfigure
+		chef_self_test=1
+	elif [ ! -f "/var/opt/opscode/nginx/ca/${CHEF_PUBLIC_IP}-ssl.conf" ];then
+		status_message "Hostname or IP may have changed, reconfiguring Chef"
+		/opt/opscode/bin/chef-server-ctl restart
+		/opt/opscode/bin/chef-server-ctl reconfigure
+		knife ssl fetch -u pivotal -k /etc/opscode/pivotal.pem -s https://${CHEF_PUBLIC_IP} > /dev/null 2>&1
+		rm -f /etc/chef/client.*
+		knife node delete -y CHEF-MASTER
+		knife client delete -y CHEF-MASTER
+		chef_self_test=1
+	fi
+#	add_chef_support_gems /opt/opscode/embedded
+
+	pivotal_cfg="-u pivotal -k /etc/opscode/pivotal.pem -s https://127.0.0.1"
+	knife ssl fetch $pivotal_cfg > /dev/null 2>&1
+
+	list_chef_users ext_chef_users 
+
+	umask 0077
+#	if ! ( echo "$ext_chef_users" | egrep "(^| )cap( |$)" > /dev/null );then
+	if  [ ! -f "$DATADIR/users/admin/admin.user.key" -o ! -f "$CHEF_CACHE/admin.org.key" ];then
+		manage_chef_user "admin" "$ADMIN_PW" "admin Master" "$ADMIN_EMAIL" "" "1" "" "1"
+	fi
+	mkdir -p "$DATADIR/users/admin"
+	echo "$ADMIN_EMAIL" > "$DATADIR/users/admin/email"
+	echo "Chef Master" > "$DATADIR/users/admin/realname"
+	if [ ! -f "$DATADIR/users/admin/htpasswd" -a "$ADMIN_PW" != "" ];then
+		# XXX this is sloppy as hell, from a security standpoint
+		/usr/bin/htpasswd -c -b -m "$DATADIR/users/admin/htpasswd" "admin" "$ADMIN_PW"
+	fi
+
+	set_knife_rb organizations/admin
+
+	/opt/chef/bin/knife ssl fetch -s https://$CHEF_PUBLIC_IP > /dev/null 2>&1
+	/opt/chef/bin/knife ssl fetch -s https://$HOSTNAME > /dev/null 2>&1
+	/opt/chef/bin/knife ssl fetch -s https://127.0.0.1 > /dev/null 2>&1
+	umask 0022
+
+	cur_chef="`rpm -q chef-server-core`"
+	if [ "$cur_chef" != "$OPSCODE_CHEF_PKG" ];then
+		status_message "Upgrading ${BOLD}Chef Server${NORM}"
+		if rpm -Uvh $OPSCODE_CHEF_DL;then
+			chef_self_test=1
+			/opt/opscode/bin/chef-server-ctl upgrade
+			find /opt/opscode/embedded/lib/ruby -type f -exec chmod o+r {} \;
+			find /opt/opscode/embedded/lib/ruby -type d -exec chmod o+rx {} \;
+			/opt/opscode/bin/chef-server-ctl reconfigure
+#			add_chef_support_gems /opt/opscode/embedded
+			/opt/opscode/bin/chef-server-ctl start
+		else
+			warning_message "Failed to upgrade to package $OPSCODE_CHEF_DL"
+		fi
+	fi
+
+	export CHEF_PUBLIC_IP
+	if ! ( echo $PATH | egrep ":/opt/opscode/embedded/bin(:|$)" > /dev/null );then
+		export PATH="$INSTALLDIR/bin:${PATH}:/opt/opscode/embedded/bin"
+	fi
+
+	mkdir -p /etc/opscode
+	cat >> /etc/opscode/chef-server.rb.tmp.$$ << EOF
+#
+# CAP Chef Server Settings
+#
+server_name="#{ENV['CHEF_PUBLIC_IP']}"
+
+api_fqdn server_name
+
+nginx['server_name'] = server_name
+nginx['enable_non_ssl'] = false
+nginx['non_ssl_port'] = 81
+EOF
+	if [ ! -f /etc/opscode/chef-server.rb -o "`diff /etc/opscode/chef-server.rb /etc/opscode/chef-server.rb.tmp.$$`" != "" ];then
+		/bin/mv -f /etc/opscode/chef-server.rb.tmp.$$ /etc/opscode/chef-server.rb
+		chef_server_ctl reconfigure
+
+		chef_server_ctl restart
+	else
+		/bin/rm -f /etc/opscode/chef-server.rb.tmp.$$
+	fi
+}
+
+
+
+
+
+###############################################################################
+###############################################################################
+###############################################################################
+# Main execution path begins here
+###############################################################################
+###############################################################################
+###############################################################################
+
+    if [ "$use_defaults" == "" ];then
+		adjust_config_vars
+    else
+    echo "################# default config parameter############"	
+    show_config_vars
+    echo "#############################"
+	fi
+
+
+	set_path_env_vars
+	set_bash_defaults
+
+	create_ssh_config
+	umask 0022
+	
+	install_system_packages
+	install_ruby
+	install_chef
+
+
+    source $CAPRC
+	/opt/chef/bin/knife ssl fetch -s https://$CHEF_PUBLIC_IP
+
+	keychain
+	
+	echo ""
+	echo "You MUST source all of the changes I made to your environment:"
+	echo ""
+	echo "${BOLD}source $CAPRC${NORM}"
+	echo ""
+	echo "Users:"
+	echo ""
+	echo ""
